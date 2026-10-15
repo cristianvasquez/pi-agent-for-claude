@@ -274,7 +274,8 @@ export async function teammatePromptOf($: EngineInterface, already: number) {
  * Takes a `pi-model: <pattern>` line out of a prompt: the way a caller picks
  * the model pi runs, since the Agent tool's own `model` names Claude models
  * only. The pattern is anything `pi --model` takes (`openrouter/<id>`, a
- * fuzzy `*sonnet*`); only the first such line counts.
+ * fuzzy `sonnet`, a `:<thinking>` suffix; not a glob); only the first such
+ * line counts.
  */
 export function modelOf(text: string): { prompt: string; model?: string } {
   const line = text.match(/^[ \t]*pi-model:[ \t]*([A-Za-z0-9_.:\/*~@+-]+)[ \t]*$/im)
@@ -312,7 +313,8 @@ export async function* respond(
  * Rewrites pi's `--mode json` event stream as one small JSON line per thing a
  * step shows: `{k:"msg"}` when an assistant message starts, `{k:"text"|
  * "thinking", t}` per delta, `{k:"tool", t}` per tool pi starts, `{k:"usage",
- * i, o, cr, cw}` per finished assistant message, `{k:"end"}`. `msg` carries
+ * i, o, cr, cw}` per finished assistant message, `{k:"error", t}` when that
+ * message failed (a provider error pi reports only in `errorMessage`), `{k:"end"}`. `msg` carries
  * the `provider/model` pi sent the request to.
  *
  * pi's own events carry whole tool outputs and transcripts, and
@@ -330,6 +332,7 @@ rl.on('line', (line) => {
   else if (e.type === 'message_end' && e.message?.role === 'assistant') {
     const u = e.message.usage ?? {}
     out({ k: 'usage', i: u.input ?? 0, o: u.output ?? 0, cr: u.cacheRead ?? 0, cw: u.cacheWrite ?? 0 })
+    if (e.message.errorMessage) out({ k: 'error', t: String(e.message.errorMessage) })
   }
   else if (d?.type === 'text_delta') out({ k: 'text', t: d.delta })
   else if (d?.type === 'thinking_delta') out({ k: 'thinking', t: d.delta })
@@ -368,6 +371,8 @@ export type Run = {
   model: string
   /** Tokens pi used since the last step reported them. */
   usage: { i: number; o: number; cr: number; cw: number }
+  /** The latest provider error pi reported, shown with the answer when it ends. */
+  error: string
 }
 
 /**
@@ -394,15 +399,15 @@ export async function start(
   const started = await $.process.run([
     'sh',
     '-c',
-    'nohup sh -c \'pi -p --mode json --session-id "$1" $5 -- "$2" </dev/null 2>"$3.err" | node -e "$4" >"$3"\' sh "$1" "$2" "$3" "$4" "$5" >/dev/null 2>&1 & echo $!',
+    'nohup sh -c \'pi -p --mode json --session-id "$1" ${5:+--model "$5"} -- "$2" </dev/null 2>"$3.err" | node -e "$4" >"$3"\' sh "$1" "$2" "$3" "$4" "$5" >/dev/null 2>&1 & echo $!',
     'sh',
     session,
     prompt,
     events,
     FILTER,
-    // Unquoted in the script so an absent model adds no argument; a pattern
-    // is one word (`openrouter/moonshotai/kimi-k2`), which modelOf enforces.
-    model ? `--model ${model}` : '',
+    // Quoted, so a fuzzy pattern (`*sonnet*`) reaches pi rather than the
+    // shell's glob; empty adds no argument.
+    model ?? '',
   ], { cwd })
   return {
     pid: started.stdout.trim(),
@@ -417,6 +422,7 @@ export async function start(
     steps: 0,
     model: '',
     usage: { i: 0, o: 0, cr: 0, cw: 0 },
+    error: '',
   }
 }
 
@@ -487,6 +493,10 @@ export async function* pump(
           run.usage.cw += event.cw ?? 0
           continue
         }
+        if (event.k === 'error') {
+          run.error = event.t ?? ''
+          continue
+        }
         const pieceKind = event.k === 'thinking' ? 'thinking' : 'text'
         const text = event.t ?? ''
         if (pieceKind !== kind) {
@@ -514,7 +524,9 @@ export async function* pump(
   if (failure) run.ended = true
 
   if (run.ended) {
-    if (!failure && !(run.shown + shown).trim()) {
+    if (!failure && run.error) {
+      failure = `pi error: ${run.error}`
+    } else if (!failure && !(run.shown + shown).trim()) {
       const { stdout: err } = await $.process.run(['sh', '-c', 'cat "$1.err" 2>/dev/null', 'sh', run.events])
         .catch(() => ({ stdout: '' }))
       // pi colours its errors; the escapes would show as noise in a transcript.
@@ -522,10 +534,17 @@ export async function* pump(
       failure = `pi ended with no answer.\n${plain || '(no stderr)'}`
     }
     if (failure) {
-      shown += failure
-      run.report = failure
-      index += 1
-      yield { kind: 'text', index, text: failure }
+      // Joined onto the text block in progress, or a new one marked as text:
+      // the caller appends the model line to the last text block, which is
+      // all the parent reads, so the failure must be in that same block.
+      const piece = kind === 'text' ? `\n\n${failure}` : failure
+      if (kind !== 'text') {
+        kind = 'text'
+        index += 1
+      }
+      shown += piece
+      run.report = run.report.trim() ? run.report + piece : failure
+      yield { kind: 'text', index, text: piece }
     }
     await $.process.run(['rm', '-f', run.events, `${run.events}.err`]).catch(() => undefined)
   }
